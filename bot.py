@@ -1,276 +1,290 @@
-import os
-import sqlite3
-import secrets
 import logging
+import os
+import re
+import sys
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Config logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
 TOKEN = os.environ.get("BALE_BOT_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
 if not TOKEN:
-    raise RuntimeError("متغیر محیطی BALE_BOT_TOKEN تنظیم نشده است.")
+    logging.critical("BALE_BOT_TOKEN environment variable is not set!")
+    sys.exit(1)
+
+if not DATABASE_URL:
+    logging.critical("DATABASE_URL environment variable is not set!")
+    sys.exit(1)
 
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
-DB_PATH = os.environ.get("DB_PATH", "/data/raffle.sqlite3")
-
-os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.row_factory = sqlite3.Row
-
-with db:
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS participants (
-            chat_id INTEGER,
-            user_id INTEGER,
-            name TEXT,
-            username TEXT,
-            PRIMARY KEY (chat_id, user_id)
-        )
-    """)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS draws (
-            chat_id INTEGER,
-            message_id INTEGER,
-            result TEXT,
-            PRIMARY KEY (chat_id, message_id)
-        )
-    """)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS state (
-            key TEXT PRIMARY KEY,
-            val TEXT
-        )
-    """)
 
 
-def api(method: str, **params):
-    url = f"{BASE_URL}/{method}"
-    res = requests.post(url, json=params, timeout=(10, 40))
-    res.raise_for_status()
-    data = res.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"خطای API بله در {method}: {data}")
-    return data.get("result")
+def get_db_connection():
+    """ایجاد اتصال به PostgreSQL"""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return conn
 
 
-def send(chat_id: int, text: str, thread_id: int = None, reply_markup: dict = None):
-    url = f"{BASE_URL}/sendMessage"
+def init_db():
+    """ایجاد جدول کاربران در صورت عدم وجود"""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    first_name TEXT,
+                    last_name TEXT,
+                    username TEXT,
+                    PRIMARY KEY (chat_id, user_id)
+                );
+            """
+            )
+        conn.commit()
+    logging.info("PostgreSQL Database initialized.")
+
+
+def send_message(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
-    if thread_id:
-        payload["message_thread_id"] = thread_id
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    res = requests.post(url, json=payload, timeout=(10, 30))
-    res.raise_for_status()
-    return res.json().get("result")
-
-
-def answer_callback(callback_query_id: str, text: str):
     try:
-        api("answerCallbackQuery", callback_query_id=callback_query_id, text=text, show_alert=True)
+        r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
+        return r.json()
     except Exception as e:
-        logging.warning("خطا در پاسخ به callback_query: %s", e)
+        logging.error(f"Error sending message: {e}")
+        return None
 
 
-def display_name(user: dict) -> str:
-    parts = [user.get("first_name", ""), user.get("last_name", "")]
-    name = " ".join(p for p in parts if p).strip()
-    return name or user.get("username") or f"کاربر {user.get('id')}"
-
-
-def is_current_member(member: dict) -> bool:
-    status = member.get("status")
-    return status in ("creator", "administrator", "member") or (
-        status == "restricted" and member.get("is_member") is True
-    )
-
-
-def get_raffle_keyboard():
+def get_panel_keyboard():
     return {
         "inline_keyboard": [
             [
-                {"text": "ثبت‌نام در قرعه‌کشی 🎟", "callback_data": "join", "style": "success"},
-                {"text": "انصراف ❌", "callback_data": "leave", "style": "danger"}
+                {
+                    "text": "🟢 عضویت در قرعه‌کشی",
+                    "callback_data": "join",
+                    "style": "success",
+                },
+                {
+                    "text": "🔴 خروج از قرعه‌کشی",
+                    "callback_data": "leave",
+                    "style": "danger",
+                },
             ]
         ]
     }
 
 
-def handle_callback(cq: dict):
-    cq_id = cq.get("id")
-    from_user = cq.get("from", {})
-    user_id = from_user.get("id")
-    msg = cq.get("message", {})
-    chat = msg.get("chat", {})
-    chat_id = chat.get("id")
-    data = cq.get("data")
+def is_user_admin(chat_id, user_id):
+    try:
+        r = requests.post(
+            f"{BASE_URL}/getChatMember",
+            json={"chat_id": chat_id, "user_id": user_id},
+            timeout=10,
+        )
+        res = r.json()
+        if res.get("ok"):
+            status = res.get("result", {}).get("status")
+            return status in ("creator", "administrator")
+    except Exception as e:
+        logging.error(f"Error checking admin: {e}")
+    return False
 
-    if not chat_id or not user_id:
-        return
 
-    name = display_name(from_user)
-    username = from_user.get("username") or ""
+def handle_join(chat_id, user):
+    user_id = user.get("id")
+    first_name = user.get("first_name", "")
+    last_name = user.get("last_name", "")
+    username = user.get("username", "")
 
-    if data == "join":
-        with db:
-            db.execute(
-                "INSERT OR REPLACE INTO participants (chat_id, user_id, name, username) VALUES (?, ?, ?, ?)",
-                (chat_id, user_id, name, username)
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM users WHERE chat_id = %s AND user_id = %s",
+                (chat_id, user_id),
             )
-        answer_callback(cq_id, f"{name} عزیز، با موفقیت ثبت‌نام شدی! ✅")
-        logging.info("کاربر %s در گروه %s ثبت‌نام کرد (دکمه شیشه‌ای)", user_id, chat_id)
+            if cur.fetchone():
+                return "شما قبلاً در قرعه‌کشی ثبت‌نام کرده‌اید! ✅"
 
-    elif data == "leave":
-        with db:
-            cur = db.execute(
-                "DELETE FROM participants WHERE chat_id = ? AND user_id = ?",
-                (chat_id, user_id)
+            cur.execute(
+                """
+                INSERT INTO users (chat_id, user_id, first_name, last_name, username)
+                VALUES (%s, %s, %s, %s, %s)
+            """,
+                (chat_id, user_id, first_name, last_name, username),
+            )
+        conn.commit()
+    return f"کاربر {first_name} با موفقیت به قرعه‌کشی اضافه شد 🎉"
+
+
+def handle_leave(chat_id, user_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM users WHERE chat_id = %s AND user_id = %s",
+                (chat_id, user_id),
             )
             deleted = cur.rowcount
-        if deleted > 0:
-            answer_callback(cq_id, "از فهرست قرعه‌کشی خارج شدی. ❌")
-        else:
-            answer_callback(cq_id, "شما قبلاً در فهرست قرعه‌کشی نبودید.")
-        logging.info("کاربر %s از گروه %s انصراف داد (دکمه شیشه‌ای)", user_id, chat_id)
+        conn.commit()
+
+    if deleted > 0:
+        return "شما از لیست قرعه‌کشی حذف شدید. ❌"
+    return "شما در لیست قرعه‌کشی حضور نداشتید."
 
 
-def handle(message: dict):
+def handle_count(chat_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) as cnt FROM users WHERE chat_id = %s", (chat_id,)
+            )
+            count = cur.fetchone()["cnt"]
+    return f"تعداد افراد ثبت‌نام‌شده در این گروه: {count} نفر"
+
+
+def handle_draw(chat_id, count_str):
+    try:
+        count = int(count_str)
+        if count <= 0:
+            return "لطفاً یک عدد بزرگتر از صفر وارد کنید."
+    except ValueError:
+        return "فرمت دستور اشتباه است. مثال: /draw 3"
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT first_name, last_name, username 
+                FROM users 
+                WHERE chat_id = %s 
+                ORDER BY RANDOM() 
+                LIMIT %s
+            """,
+                (chat_id, count),
+            )
+            winners = cur.fetchall()
+
+    if not winners:
+        return "هیچ فردی برای قرعه‌کشی ثبت‌نام نکرده است!"
+
+    text = f"🎉 **برندگان قرعه‌کشی ({len(winners)} نفر):**\n\n"
+    for idx, w in enumerate(winners, 1):
+        name = f"{w['first_name'] or ''} {w['last_name'] or ''}".strip()
+        uname = f" (@{w['username']})" if w["username"] else ""
+        text += f"{idx}. {name}{uname}\n"
+
+    return text
+
+
+def handle_callback(callback_query):
+    query_id = callback_query.get("id")
+    from_user = callback_query.get("from", {})
+    message = callback_query.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    data = callback_query.get("data")
+
+    if not chat_id:
+        return
+
+    reply_text = ""
+    if data == "join":
+        reply_text = handle_join(chat_id, from_user)
+    elif data == "leave":
+        reply_text = handle_leave(chat_id, from_user.get("id"))
+
+    if reply_text:
+        send_message(chat_id, reply_text)
+
+    # Answer callback query to remove loading state
+    try:
+        requests.post(
+            f"{BASE_URL}/answerCallbackQuery",
+            json={"callback_query_id": query_id},
+            timeout=5,
+        )
+    except Exception as e:
+        logging.error(f"Error answering callback query: {e}")
+
+
+def handle_update(update):
+    if "callback_query" in update:
+        handle_callback(update["callback_query"])
+        return
+
+    message = update.get("message")
+    if not message:
+        return
+
     chat = message.get("chat", {})
-    chat_type = chat.get("type", "")
-    if chat_type not in ("group", "supergroup"):
-        return
+    chat_id = chat.get("id")
+    chat_type = chat.get("type")
+    user = message.get("from", {})
+    user_id = user.get("id")
+    text = message.get("text", "").strip()
 
-    from_user = message.get("from", {})
-    if from_user.get("is_bot"):
-        return
-
-    text = (message.get("text") or "").strip()
     if not text.startswith("/"):
         return
 
-    chat_id = chat.get("id")
-    thread_id = message.get("message_thread_id")
-    parts = text.split()
-    cmd = parts[0].split("@")[0].lower()
+    cmd_parts = text.split(maxsplit=1)
+    cmd = cmd_parts[0].lower()
+    args = cmd_parts[1] if len(cmd_parts) > 1 else ""
 
-    # ارسال پنل شیشه‌ای قرعه‌کشی با دکمه‌ها
-    if cmd in ("/panel", "/raffle", "/start"):
-        send(
-            chat_id,
-            "🎉 **پنل ثبت‌نام در قرعه‌کشی**\nبرای شرکت یا انصراف، از دکمه‌های زیر استفاده کنید:",
-            thread_id=thread_id,
-            reply_markup=get_raffle_keyboard()
+    if "@" in cmd:
+        cmd = cmd.split("@")[0]
+
+    if cmd in ("/panel", "/start"):
+        send_message(
+            chat_id, "پنل قرعه‌کشی گروه:", reply_markup=get_panel_keyboard()
         )
-        return
 
-    if cmd == "/join":
-        user_id = from_user.get("id")
-        name = display_name(from_user)
-        username = from_user.get("username") or ""
-        with db:
-            db.execute(
-                "INSERT OR REPLACE INTO participants (chat_id, user_id, name, username) VALUES (?, ?, ?, ?)",
-                (chat_id, user_id, name, username)
-            )
-        send(chat_id, f"«{name}»، برای قرعه‌کشی ثبت شدی ✅", thread_id=thread_id)
+    elif cmd == "/join":
+        msg = handle_join(chat_id, user)
+        send_message(chat_id, msg)
 
     elif cmd == "/leave":
-        user_id = from_user.get("id")
-        with db:
-            db.execute("DELETE FROM participants WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-        send(chat_id, "از فهرست قرعه‌کشی خارج شدی.", thread_id=thread_id)
+        msg = handle_leave(chat_id, user_id)
+        send_message(chat_id, msg)
 
     elif cmd == "/count":
-        cur = db.execute("SELECT COUNT(*) as c FROM participants WHERE chat_id = ?", (chat_id,))
-        count = cur.fetchone()["c"]
-        send(chat_id, f"تعداد افراد ثبت‌نام‌شده: {count} نفر", thread_id=thread_id)
+        msg = handle_count(chat_id)
+        send_message(chat_id, msg)
 
     elif cmd == "/draw":
-        msg_id = message.get("message_id")
-        user_id = from_user.get("id")
-
-        admins = api("getChatAdministrators", chat_id=chat_id)
-        admin_ids = {a.get("user", {}).get("id") for a in admins}
-        if user_id not in admin_ids:
-            send(chat_id, "فقط مدیران گروه می‌توانند قرعه‌کشی را اجرا کنند.", thread_id=thread_id)
-            return
-
-        if len(parts) < 2 or not parts[1].isdigit():
-            send(chat_id, "فرمت دستور نادرست است.\nنمونه: `/draw 3`", thread_id=thread_id)
-            return
-
-        count_req = int(parts[1])
-        if count_req <= 0:
-            send(chat_id, "تعداد برندگان باید حداقل ۱ باشد.", thread_id=thread_id)
-            return
-
-        cur = db.execute("SELECT result FROM draws WHERE chat_id = ? AND message_id = ?", (chat_id, msg_id))
-        prev = cur.fetchone()
-        if prev:
-            send(chat_id, prev["result"], thread_id=thread_id)
-            return
-
-        cur = db.execute("SELECT user_id, name, username FROM participants WHERE chat_id = ?", (chat_id,))
-        registered = cur.fetchall()
-
-        eligible = []
-        for p in registered:
-            try:
-                m = api("getChatMember", chat_id=chat_id, user_id=p["user_id"])
-                if is_current_member(m) and not m.get("user", {}).get("is_bot"):
-                    eligible.append(p)
-            except Exception:
-                continue
-
-        total = len(eligible)
-        if total == 0:
-            send(chat_id, "هیچ شرکت‌کننده واجد شرایطی یافت نشد.", thread_id=thread_id)
-            return
-
-        if count_req > total:
-            send(chat_id, f"تعداد درخواستی ({count_req}) بیشتر از کل شرکت‌کنندگان واجد شرایط ({total}) است.", thread_id=thread_id)
-            return
-
-        winners = secrets.SystemRandom().sample(eligible, count_req)
-
-        lines = [f"🎉 نتیجهٔ قرعه‌کشی: {count_req} برنده از {total} شرکت‌کننده:"]
-        for idx, w in enumerate(winners, start=1):
-            uname = f"@{w['username']}" if w["username"] else "بدون نام‌کاربری"
-            lines.append(f"{idx}. {w['name']} | {uname} | شناسه: {w['user_id']}")
-
-        result_text = "\n".join(lines)
-        with db:
-            db.execute("INSERT OR REPLACE INTO draws (chat_id, message_id, result) VALUES (?, ?, ?)",
-                       (chat_id, msg_id, result_text))
-
-        send(chat_id, result_text, thread_id=thread_id)
+        if chat_type in ("group", "supergroup"):
+            if not is_user_admin(chat_id, user_id):
+                send_message(
+                    chat_id, "⛔ شما دسترسی مدیر برای قرعه‌کشی را ندارید."
+                )
+                return
+        msg = handle_draw(chat_id, args)
+        send_message(chat_id, msg)
 
 
 def main():
-    cur = db.execute("SELECT val FROM state WHERE key = 'offset'")
-    row = cur.fetchone()
-    offset = int(row["val"]) if row else 0
-
-    logging.info("بات قرعه‌کشی با پشتیبانی از دکمه‌های شیشه‌ای شروع به کار کرد...")
+    init_db()
+    offset = 0
+    logging.info("Starting Bale Raffle Bot (PostgreSQL)...")
 
     while True:
         try:
-            updates = api("getUpdates", offset=offset, timeout=25)
-            for upd in updates:
-                offset = upd["update_id"] + 1
-                with db:
-                    db.execute("INSERT OR REPLACE INTO state (key, val) VALUES ('offset', ?)", (str(offset),))
-
-                if "message" in upd:
-                    handle(upd["message"])
-                elif "callback_query" in upd:
-                    handle_callback(upd["callback_query"])
-
-        except requests.RequestException as e:
-            logging.warning("خطای شبکه: %s", e)
+            r = requests.get(
+                f"{BASE_URL}/getUpdates",
+                params={"offset": offset, "timeout": 20},
+                timeout=25,
+            )
+            data = r.json()
+            if data.get("ok"):
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    handle_update(update)
         except Exception as e:
-            logging.error("خطای غیرمنتظره: %s", e)
-
-
-if __name__ == "__main__":
-    main()
+            logging.error(f"Polling error: {e}")
