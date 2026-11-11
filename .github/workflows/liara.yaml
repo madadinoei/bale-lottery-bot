@@ -20,7 +20,7 @@ jobs:
 
       - name: Deploy to Liara
         env:
-          LIARA_TOKEN: ${{ secrets.LIARA_API_TOKEN }}
+          LIARA_API_TOKEN: ${{ secrets.LIARA_API_TOKEN }}
         run: |
           npm i -g @liara/cli@9
-          liara deploy --app="kanoonquran" --platform=docker --api-token="$LIARA_TOKEN" --no-app-logs
+          liara deploy --app="kanoonquran" --platform=docker --port=3000 --api-token="${{ secrets.LIARA_API_TOKEN }}" --no-app-logs
