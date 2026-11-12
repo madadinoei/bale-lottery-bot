@@ -1,6 +1,5 @@
 import logging
 import os
-import re
 import sys
 import requests
 import psycopg2
@@ -106,15 +105,27 @@ def handle_join(chat_id, user):
     last_name = user.get("last_name", "")
     username = user.get("username", "")
 
+    # ساخت نام نمایشی برای کاربر جدید
+    full_name = f"{first_name} {last_name}".strip() or "کاربر"
+    user_display = f"{full_name} (@{username})" if username else full_name
+
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            # بررسی وجود کاربر
             cur.execute(
-                "SELECT 1 FROM users WHERE chat_id = %s AND user_id = %s",
+                "SELECT first_name, last_name, username FROM users WHERE chat_id = %s AND user_id = %s",
                 (chat_id, user_id),
             )
-            if cur.fetchone():
-                return "شما قبلاً در قرعه‌کشی ثبت‌نام کرده‌اید! ✅"
+            existing_user = cur.fetchone()
 
+            if existing_user:
+                # فرمت کردن نام کاربر قبلاً ثبت‌نام شده
+                ex_name = f"{existing_user['first_name'] or ''} {existing_user['last_name'] or ''}".strip() or "کاربر"
+                ex_uname = existing_user["username"]
+                ex_display = f"{ex_name} (@{ex_uname})" if ex_uname else ex_name
+                return f"کاربر {ex_display}، ثبت‌نام شما قبلاً در قرعه‌کشی انجام شده است! ✅"
+
+            # درج کاربر جدید
             cur.execute(
                 """
                 INSERT INTO users (chat_id, user_id, first_name, last_name, username)
@@ -123,7 +134,7 @@ def handle_join(chat_id, user):
                 (chat_id, user_id, first_name, last_name, username),
             )
         conn.commit()
-    return f"کاربر {first_name} با موفقیت به قرعه‌کشی اضافه شد 🎉"
+    return f"کاربر {user_display} با موفقیت به قرعه‌کشی اضافه شد 🎉"
 
 
 def handle_leave(chat_id, user_id):
@@ -137,7 +148,7 @@ def handle_leave(chat_id, user_id):
         conn.commit()
 
     if deleted > 0:
-        return "شما از لیست قرعه‌کشی حذف شدید. ❌"
+        return "شما از لیست قرعه‌کشی خارج شدید. ❌"
     return "شما در لیست قرعه‌کشی حضور نداشتید."
 
 
@@ -178,7 +189,7 @@ def handle_draw(chat_id, count_str):
 
     text = f"🎉 **برندگان قرعه‌کشی ({len(winners)} نفر):**\n\n"
     for idx, w in enumerate(winners, 1):
-        name = f"{w['first_name'] or ''} {w['last_name'] or ''}".strip()
+        name = f"{w['first_name'] or ''} {w['last_name'] or ''}".strip() or "کاربر"
         uname = f" (@{w['username']})" if w["username"] else ""
         text += f"{idx}. {name}{uname}\n"
 
@@ -204,7 +215,6 @@ def handle_callback(callback_query):
     if reply_text:
         send_message(chat_id, reply_text)
 
-    # Answer callback query to remove loading state
     try:
         requests.post(
             f"{BASE_URL}/answerCallbackQuery",
